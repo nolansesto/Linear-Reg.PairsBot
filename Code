@@ -1,0 +1,164 @@
+import requests
+import pandas as pd
+import datetime
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+
+# Your Polygon.io API key
+API_KEY = 'Enter API Key'
+
+# Function to convert date and time to Unix timestamp in milliseconds
+def to_unix_timestamp(date_time_str):
+    dt = datetime.datetime.strptime(date_time_str, '%Y-%m-%dT%H:%M:%S')
+    return int(dt.timestamp() * 1000)
+
+# Function to fetch historical data (fetching daily data)
+def fetch_historical_data(ticker, start_date, end_date, timespan='day'):
+    start_timestamp = to_unix_timestamp(start_date)
+    end_timestamp = to_unix_timestamp(end_date)
+    url = f'https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/{timespan}/{start_timestamp}/{end_timestamp}?adjusted=true&sort=asc&limit=50000&apiKey={API_KEY}'
+
+    response = requests.get(url)
+
+    if response.status_code != 200:
+        print(f"Error fetching data: {response.status_code} - {response.text}")
+        return None
+
+    data = response.json()
+
+    if 'results' in data:
+        return data['results']
+    else:
+        print(f"No results found for {ticker} from {start_date} to {end_date}")
+    return None
+
+# Function to calculate ATR
+def calculate_atr(data, period=14):
+    # Assume 'c' is close, 'h' is high, and 'l' is low, as per the Polygon.io API response
+    data['High-Low'] = data['high'] - data['low']
+    data['High-PrevClose'] = abs(data['high'] - data['AUD/USD'].shift(1))  # Adjusted 'AUD/USD' for close price
+    data['Low-PrevClose'] = abs(data['low'] - data['AUD/USD'].shift(1))  # Adjusted 'AUD/USD' for close price
+    true_range = data[['High-Low', 'High-PrevClose', 'Low-PrevClose']].max(axis=1)
+    atr = true_range.rolling(window=period).mean()
+    return atr
+
+# Function to calculate SMA
+def calculate_sma(data, window):
+    return data['AUD/USD'].rolling(window=window).mean()
+
+# Function to calculate residuals and check entry conditions
+def backtest_strategy(data):
+    data['SMA'] = calculate_sma(data, window=200)
+
+    X = sm.add_constant(data['NZD/USD'])
+    model = sm.OLS(data['AUD/USD'], X).fit()
+    data['residuals'] = model.resid
+
+    # Calculate ATR
+    data['ATR'] = calculate_atr(data)
+
+    # Save residuals to CSV
+    residuals_csv_path = '/Users/nolansesto/PycharmProjects/AusyBot/residuals_data.csv'
+    data[['residuals']].to_csv(residuals_csv_path)
+    print(f"Residuals saved to {residuals_csv_path}")
+
+    # Save SMA data to CSV
+    sma_csv_path = '/Users/nolansesto/PycharmProjects/AusyBot/sma_data.csv'
+    data[['SMA']].to_csv(sma_csv_path)
+    print(f"SMA data saved to {sma_csv_path}")
+
+    # Conditions for shorting (as per your strategy)
+    data['short_signal'] = (data['AUD/USD'] > data['SMA'] * 1.0135) & (data['residuals'] > 0.001 * 4.5) & (data['ATR'] < 0.01)
+
+    # Conditions for closing a short or long (exit when AUD/USD meets the SMA within a small tolerance)
+    epsilon = 0.0001  # Define tolerance for closing a trade
+    data['close_signal'] = (abs(data['AUD/USD'] - data['SMA']) <= epsilon)
+
+    # Conditions for buying long
+    data['long_signal'] = (data['AUD/USD'] < data['SMA'] * 0.9865) & (data['residuals'] < -0.001 * 4.5) & (data['ATR'] < 0.01)
+
+    # Print ATR for each entry signal (short or long)
+    entry_count = 1  # Initialize counter for entry signals
+
+    for i in range(len(data)):
+        if data['short_signal'].iloc[i]:
+            print(f"{entry_count}: ATR = {data['ATR'].iloc[i]:.6f} | Short Position | Date: {data.index[i]}")
+            entry_count += 1
+        elif data['long_signal'].iloc[i]:
+            print(f"{entry_count}: ATR = {data['ATR'].iloc[i]:.6f} | Long Position | Date: {data.index[i]}")
+            entry_count += 1
+
+    return data
+
+# Function to plot the results (September 15th 2016 - September 15th 2017)
+def plot_backtest(data):
+    # Filter data to only include between September 15th 2016 and September 15th 2017
+    start_plot_date = '2023-09-15'
+    end_plot_date = '2024-10-17'
+    plot_data = data[(data.index >= start_plot_date) & (data.index <= end_plot_date)]
+
+    plt.figure(figsize=(14, 7))
+
+    # Plot AUD/USD and SMA
+    plt.plot(plot_data.index, plot_data['AUD/USD'], label='AUD/USD', color='black')
+    plt.plot(plot_data.index, plot_data['SMA'], label='SMA (200-day)', color='blue', linestyle='--')
+
+    # Plot the signals
+    # Red dots for short entry signals
+    plt.scatter(plot_data.index[plot_data['short_signal']], plot_data['AUD/USD'][plot_data['short_signal']],
+                color='red', marker='o', s=100, label='Short Entry')
+
+
+    # Green dots for buy entry signals
+    plt.scatter(plot_data.index[plot_data['long_signal']], plot_data['AUD/USD'][plot_data['long_signal']],
+                color='blue', marker='^', s=100, label='Buy (Long Entry)')
+
+    # Add labels and title
+    plt.title('AUD/USD with Trade Signals (September 15th 2016 - September 15th 2017)')
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.legend()
+
+    # Save the plot
+    plt.savefig('/Users/nolansesto/PycharmProjects/AusyBot/backtest_plot_2016_2017.png')
+    plt.show()
+
+# Load historical data and run backtest
+start_date = '2023-02-28T00:00:00'  # Start from February 28th 2016 to calculate the SMA
+end_date = '2024-10-17T00:00:00'  # End at September 15th 2021
+
+# Fetching historical data for AUD/USD and NZD/USD
+data_aud = fetch_historical_data('C:AUDUSD', start_date, end_date, timespan='day')
+data_nzd = fetch_historical_data('C:NZDUSD', start_date, end_date, timespan='day')
+
+# Convert to DataFrame
+if data_aud and data_nzd:
+    df_aud = pd.DataFrame(data_aud)
+    df_nzd = pd.DataFrame(data_nzd)
+
+    df_aud['t'] = pd.to_datetime(df_aud['t'], unit='ms')
+    df_nzd['t'] = pd.to_datetime(df_nzd['t'], unit='ms')
+
+    df_aud = df_aud.set_index('t')
+    df_nzd = df_nzd.set_index('t')
+
+    # Merge AUD/USD and NZD/USD data
+    data = df_aud[['c', 'h', 'l']].rename(columns={'c': 'AUD/USD', 'h': 'high', 'l': 'low'}).join(
+        df_nzd[['c']].rename(columns={'c': 'NZD/USD'}), how='inner')
+
+    # Run the backtesting strategy
+    backtested_data = backtest_strategy(data)
+
+    #Plot the results with signals from September 15th 2016 to September 15th 2017
+    plot_backtest(backtested_data)
+else:
+    print("Error fetching data.")
+####################################
+for i in range(len(data)):
+    print(f"Date: {data.index[i]}, Residuals: {data['residuals'].iloc[i]}, ATR: {data['ATR'].iloc[i]}")
+    if data['short_signal'].iloc[i]:
+        print(f"Short signal triggered on {data.index[i]}")
+    if data['long_signal'].iloc[i]:
+        print(f"Long signal triggered on {data.index[i]}")
+
+# if there is a ATR >or= 0.01 then you wont trade that position until ATR has calmed down and the position has changed its type to long/short.
